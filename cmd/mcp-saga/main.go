@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -11,8 +12,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	"mcp-saga/internal/compensator"
 	"mcp-saga/internal/proxy"
 	"mcp-saga/internal/store"
+
+	_ "modernc.org/sqlite"
 )
 
 var version = "0.1.0-alpha"
@@ -20,11 +24,13 @@ var version = "0.1.0-alpha"
 func main() {
 	var (
 		dbPath      string
+		appDBPath   string
 		showVersion bool
 		verbose     bool
 	)
 
 	flag.StringVar(&dbPath, "db", "mcp_saga_wal.db", "Path to SQLite WAL database")
+	flag.StringVar(&appDBPath, "app-db", "", "Path to target application SQLite database (defaults to SQLITE_DB_PATH)")
 	flag.BoolVar(&showVersion, "version", false, "Print version")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging to stderr")
 	flag.Usage = func() {
@@ -66,7 +72,27 @@ func main() {
 	}
 	defer downstream.Close()
 
-	sagaProxy := proxy.NewSagaProxy(walStore, downstream, nil)
+	if appDBPath == "" {
+		appDBPath = os.Getenv("SQLITE_DB_PATH")
+	}
+	var comp *compensator.PostgresCompensator
+	if appDBPath != "" {
+		// Read-only pre-image connection to the database the downstream server mutates.
+		appDB, err := sql.Open("sqlite", appDBPath+"?_pragma=busy_timeout(5000)")
+		if err == nil {
+			err = appDB.Ping()
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open application database %s: %v\n", appDBPath, err)
+			os.Exit(1)
+		}
+		defer appDB.Close()
+		comp = compensator.NewPostgresCompensator(appDB)
+		log.Printf("pre-image compensation enabled for %s", appDBPath)
+	} else {
+		fmt.Fprintln(os.Stderr, "[mcp-saga] warning: no -app-db / SQLITE_DB_PATH set; SQL steps will not get automatic compensations")
+	}
+	sagaProxy := proxy.NewSagaProxy(walStore, downstream, comp)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -83,6 +109,7 @@ func main() {
 	buf := make([]byte, 1024*1024)
 	scanner.Buffer(buf, 4*1024*1024)
 
+	out := bufio.NewWriter(os.Stdout)
 	for scanner.Scan() {
 		raw := scanner.Bytes()
 		if len(raw) == 0 {
@@ -90,7 +117,12 @@ func main() {
 		}
 		resp := sagaProxy.HandleRequest(ctx, raw)
 		if resp != nil {
-			fmt.Println(string(resp))
+			out.Write(resp)
+			out.WriteByte('\n')
+			out.Flush()
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "[mcp-saga] stdin read error: %v\n", err)
 	}
 }
