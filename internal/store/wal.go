@@ -89,7 +89,14 @@ func (s *SagaStore) RecordCommittedStep(sagaID string, stepIndex int, toolName s
 
 	var prevRoot string
 	err := s.db.QueryRow("SELECT current_merkle_root FROM sagas WHERE saga_id = ?", sagaID).Scan(&prevRoot)
-	if err != nil {
+	if err == sql.ErrNoRows {
+		// Steps may reference a saga that was never begun through this proxy:
+		// create its header so the journal's foreign key holds.
+		if _, err := s.db.Exec("INSERT INTO sagas (saga_id, session_id, status, current_merkle_root) VALUES (?, 'session_implicit', 'ACTIVE', '')", sagaID); err != nil {
+			return "", fmt.Errorf("auto-initialize saga %s: %w", sagaID, err)
+		}
+		prevRoot = ""
+	} else if err != nil {
 		return "", err
 	}
 
@@ -176,6 +183,22 @@ func (s *SagaStore) CurrentMerkleRoot(sagaID string) (string, error) {
 	var root string
 	err := s.db.QueryRow("SELECT current_merkle_root FROM sagas WHERE saga_id = ?", sagaID).Scan(&root)
 	return root, err
+}
+
+// NextStepIndex returns the step index following the highest journaled one.
+func (s *SagaStore) NextStepIndex(sagaID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var max sql.NullInt64
+	err := s.db.QueryRow("SELECT MAX(step_index) FROM saga_journal WHERE saga_id = ?", sagaID).Scan(&max)
+	if err != nil {
+		return 0, err
+	}
+	if !max.Valid {
+		return 1, nil
+	}
+	return int(max.Int64) + 1, nil
 }
 
 func (s *SagaStore) Close() error {

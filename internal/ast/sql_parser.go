@@ -1,9 +1,25 @@
 package ast
 
 import (
+	"regexp"
 	"strings"
 	"unicode"
 )
+
+var (
+	whereRe  = regexp.MustCompile(`(?i)\sWHERE\s`)
+	insertRe = regexp.MustCompile(`(?is)^INSERT\s+(?:OR\s+(\w+)\s+)?INTO\s+([^\s(;]+)`)
+)
+
+// extractWhere returns the predicate after the first WHERE keyword.
+func extractWhere(clean string) string {
+	loc := whereRe.FindStringIndex(clean)
+	if loc == nil {
+		return ""
+	}
+	w := strings.TrimSpace(clean[loc[1]:])
+	return strings.TrimSpace(strings.TrimSuffix(w, ";"))
+}
 
 type SQLMutationClass string
 
@@ -54,13 +70,8 @@ func InspectSQL(query string) ParsedMutation {
 		if len(parts) >= 2 {
 			res.Table = strings.Trim(parts[1], `";`)
 		}
-		if idx := strings.Index(upper, " WHERE "); idx != -1 {
-			res.WhereClause = strings.TrimSpace(clean[idx+7:])
-			res.WhereClause = strings.TrimSuffix(res.WhereClause, ";")
-			res.IsReversible = true
-		} else {
-			res.IsReversible = false
-		}
+		res.WhereClause = extractWhere(clean)
+		res.IsReversible = res.WhereClause != ""
 		return res
 	}
 
@@ -70,12 +81,17 @@ func InspectSQL(query string) ParsedMutation {
 		if len(parts) >= 3 && strings.ToUpper(parts[1]) == "FROM" {
 			res.Table = strings.Trim(parts[2], `";`)
 		}
-		if idx := strings.Index(upper, " WHERE "); idx != -1 {
-			res.WhereClause = strings.TrimSpace(clean[idx+7:])
-			res.WhereClause = strings.TrimSuffix(res.WhereClause, ";")
-			res.IsReversible = true
-		} else {
-			res.IsReversible = false
+		res.WhereClause = extractWhere(clean)
+		res.IsReversible = res.WhereClause != ""
+		return res
+	}
+
+	if strings.HasPrefix(upper, "INSERT") {
+		res.Class = ClassInsert
+		if m := insertRe.FindStringSubmatch(clean); m != nil {
+			res.Table = strings.Trim(m[2], `"`)
+			// OR REPLACE overwrites existing rows, which a rowid diff cannot undo.
+			res.IsReversible = !strings.EqualFold(m[1], "REPLACE")
 		}
 		return res
 	}
