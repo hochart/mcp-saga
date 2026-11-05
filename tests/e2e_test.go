@@ -220,7 +220,8 @@ func TestE2E_AbortAndCommit(t *testing.T) {
 	c.tool("saga_begin", map[string]any{})
 	c.tool("execute", map[string]any{"sql": "INSERT INTO audit_logs (account_id, action) VALUES (43, 'A'), (44, 'B')"})
 	c.tool("execute", map[string]any{"sql": "DELETE FROM accounts WHERE id = 43 AND 0"})
-	if txt, isErr := c.tool("saga_abort", map[string]any{}); isErr || !strings.Contains(txt, "rolled back") {
+	c.tool("query", map[string]any{"sql": "SELECT COUNT(*) FROM audit_logs"})
+	if txt, isErr := c.tool("saga_abort", map[string]any{}); isErr || !strings.Contains(txt, "rolled back (1 step(s) compensated)") {
 		t.Fatalf("abort: %v %s", isErr, txt)
 	}
 	if got := snapshot(t, app); got != baseline {

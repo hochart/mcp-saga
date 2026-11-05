@@ -388,9 +388,11 @@ func isFailure(resp map[string]any) bool {
 	return false
 }
 
-// executeRollback replays compensations in LIFO order. It stops at the first
-// failed compensation, leaving that step and earlier ones COMMITTED so the
-// rollback can be retried.
+// executeRollback replays compensations in LIFO order and returns how many
+// steps were actually undone (steps with nothing to undo, such as reads, are
+// marked COMPENSATED but not counted). It stops at the first failed
+// compensation, leaving that step and earlier ones COMMITTED so the rollback
+// can be retried.
 func (p *SagaProxy) executeRollback(ctx context.Context, sagaID string) (int, error) {
 	steps, err := p.store.GetStepsForRollback(sagaID)
 	if err != nil {
@@ -399,7 +401,8 @@ func (p *SagaProxy) executeRollback(ctx context.Context, sagaID string) (int, er
 	done := 0
 	for _, step := range steps {
 		payload := strings.TrimSpace(step.CompPayload)
-		if payload != "" && step.CompTool != "" {
+		undo := payload != "" && step.CompTool != ""
+		if undo {
 			calls := []json.RawMessage{json.RawMessage(payload)}
 			if strings.HasPrefix(payload, "[") {
 				calls = nil
@@ -421,7 +424,9 @@ func (p *SagaProxy) executeRollback(ctx context.Context, sagaID string) (int, er
 		if err := p.store.MarkStepCompensated(sagaID, step.StepIndex); err != nil {
 			return done, err
 		}
-		done++
+		if undo {
+			done++
+		}
 	}
 	return done, nil
 }
