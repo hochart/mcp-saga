@@ -247,3 +247,52 @@ func TestE2E_AbortAndCommit(t *testing.T) {
 		t.Fatalf("passthrough query: %v %s", isErr, txt)
 	}
 }
+
+// An INSERT that supplies an explicit id below the table's current maximum
+// rowid must still be undone on abort, without touching rows that existed
+// before the saga.
+func TestE2E_ExplicitLowIDInsertIsUndone(t *testing.T) {
+	app := seedApp(t) // accounts 42, 43, 44
+	baseline := snapshot(t, app)
+	c := startProxy(t, app)
+	c.handshake()
+
+	c.tool("saga_begin", map[string]any{})
+	for _, s := range []string{
+		// Explicit key via column list, below max(rowid) = 44.
+		"INSERT INTO accounts (id, email, tier) VALUES (7, 'low@x.io', 'free')",
+		// No column list: every column, including the key, is explicit.
+		// Mixes one id below and one above the original maximum.
+		"INSERT INTO accounts VALUES (40, 'mid@x.io', 'pro', NULL), (100, 'high@x.io', 'pro', NULL)",
+		// Auto-assigned key alongside, to check both paths in one saga.
+		"INSERT INTO accounts (email, tier) VALUES ('auto@x.io', 'free')",
+	} {
+		if txt, isErr := c.tool("execute", map[string]any{"sql": s}); isErr {
+			t.Fatalf("step %q failed: %s", s, txt)
+		}
+	}
+	if txt, isErr := c.tool("saga_abort", map[string]any{}); isErr || !strings.Contains(txt, "rolled back (3 step(s) compensated)") {
+		t.Fatalf("abort: %v %s", isErr, txt)
+	}
+	if got := snapshot(t, app); got != baseline {
+		t.Fatalf("explicit-id inserts not undone.\nwant:\n%s\ngot:\n%s", baseline, got)
+	}
+}
+
+// An upsert can modify an existing row, which deleting new rowids cannot
+// undo, so it must be refused inside a saga.
+func TestE2E_UpsertRefusedInsideSaga(t *testing.T) {
+	app := seedApp(t)
+	baseline := snapshot(t, app)
+	c := startProxy(t, app)
+	c.handshake()
+
+	c.tool("saga_begin", map[string]any{})
+	txt, isErr := c.tool("execute", map[string]any{"sql": "INSERT INTO ledgers (account_id, credits) VALUES (42, 0) ON CONFLICT(account_id) DO UPDATE SET credits = 0"})
+	if !isErr || !strings.Contains(txt, "refused") {
+		t.Fatalf("expected upsert to be refused, got %v %s", isErr, txt)
+	}
+	if got := snapshot(t, app); got != baseline {
+		t.Fatalf("refused upsert changed state.\nwant:\n%s\ngot:\n%s", baseline, got)
+	}
+}
